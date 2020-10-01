@@ -8,18 +8,21 @@ import (
 	"sync"
 
 	"github.com/docker/distribution"
-	dcontext "github.com/docker/distribution/context"
+	//dcontext "github.com/docker/distribution/context"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/distribution/registry/proxy/scheduler"
 	"github.com/opencontainers/go-digest"
+	"errors"
 )
 
 type proxyBlobStore struct {
 	localStore     distribution.BlobStore
 	remoteStore    distribution.BlobService
+	remoteStoreAll   []distribution.BlobService
 	scheduler      *scheduler.TTLExpirationScheduler
 	repositoryName reference.Named
 	authChallenger authChallenger
+	urlPrefixAll	[]string
 }
 
 var _ distribution.BlobStore = &proxyBlobStore{}
@@ -38,16 +41,34 @@ func setResponseHeaders(w http.ResponseWriter, length int64, mediaType string, d
 }
 
 func (pbs *proxyBlobStore) copyContent(ctx context.Context, dgst digest.Digest, writer io.Writer) (distribution.Descriptor, error) {
-	desc, err := pbs.remoteStore.Stat(ctx, dgst)
+	var activeStore distribution.BlobService = nil
+	var desc distribution.Descriptor
+	var err error
+
+	for _, i := range MatchProjectPrefix(ctx, pbs.urlPrefixAll) {
+		if err = pbs.authChallenger.tryEstablishChallenges(ctx, i); err != nil {
+			return distribution.Descriptor{}, err
+		}
+		activeStore = pbs.remoteStoreAll[i]
+		desc, err = activeStore.Stat(ctx, dgst)
+		if err == nil {
+			break
+		}
+	}
+
 	if err != nil {
 		return distribution.Descriptor{}, err
+	}
+
+	if activeStore == nil {
+		return distribution.Descriptor{}, errors.New("no project prefix matched")
 	}
 
 	if w, ok := writer.(http.ResponseWriter); ok {
 		setResponseHeaders(w, desc.Size, desc.MediaType, dgst)
 	}
 
-	remoteReader, err := pbs.remoteStore.Open(ctx, dgst)
+	remoteReader, err := activeStore.Open(ctx, dgst)
 	if err != nil {
 		return distribution.Descriptor{}, err
 	}
@@ -106,6 +127,7 @@ func (pbs *proxyBlobStore) storeLocal(ctx context.Context, dgst digest.Digest) e
 }
 
 func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) error {
+	/*
 	served, err := pbs.serveLocal(ctx, w, r, dgst)
 	if err != nil {
 		dcontext.GetLogger(ctx).Errorf("Error serving blob from local storage: %s", err.Error())
@@ -115,10 +137,7 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 	if served {
 		return nil
 	}
-
-	if err := pbs.authChallenger.tryEstablishChallenges(ctx); err != nil {
-		return err
-	}
+	*/
 
 	mu.Lock()
 	_, ok := inflight[dgst]
@@ -130,6 +149,7 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 	inflight[dgst] = struct{}{}
 	mu.Unlock()
 
+	/*
 	go func(dgst digest.Digest) {
 		if err := pbs.storeLocal(ctx, dgst); err != nil {
 			dcontext.GetLogger(ctx).Errorf("Error committing to storage: %s", err.Error())
@@ -143,8 +163,9 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 
 		pbs.scheduler.AddBlob(blobRef, repositoryTTL)
 	}(dgst)
+	*/
 
-	_, err = pbs.copyContent(ctx, dgst, w)
+	_, err := pbs.copyContent(ctx, dgst, w)
 	if err != nil {
 		return err
 	}
@@ -152,7 +173,7 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 }
 
 func (pbs *proxyBlobStore) Stat(ctx context.Context, dgst digest.Digest) (distribution.Descriptor, error) {
-	desc, err := pbs.localStore.Stat(ctx, dgst)
+	/*desc, err := pbs.localStore.Stat(ctx, dgst)
 	if err == nil {
 		return desc, err
 	}
@@ -160,33 +181,57 @@ func (pbs *proxyBlobStore) Stat(ctx context.Context, dgst digest.Digest) (distri
 	if err != distribution.ErrBlobUnknown {
 		return distribution.Descriptor{}, err
 	}
+	*/
 
-	if err := pbs.authChallenger.tryEstablishChallenges(ctx); err != nil {
-		return distribution.Descriptor{}, err
+	var des distribution.Descriptor = distribution.Descriptor{}
+	var err error
+
+	for _, i := range MatchProjectPrefix(ctx, pbs.urlPrefixAll) {
+		if err := pbs.authChallenger.tryEstablishChallenges(ctx, i); err != nil {
+			return distribution.Descriptor{}, err
+		}
+		activeStore := pbs.remoteStoreAll[i]
+		des, err = activeStore.Stat(ctx, dgst)
+		if err == nil {
+			break
+		}
 	}
 
-	return pbs.remoteStore.Stat(ctx, dgst)
+	return des, err
 }
 
 func (pbs *proxyBlobStore) Get(ctx context.Context, dgst digest.Digest) ([]byte, error) {
+	/*
 	blob, err := pbs.localStore.Get(ctx, dgst)
 	if err == nil {
 		return blob, nil
 	}
+	*/
 
-	if err := pbs.authChallenger.tryEstablishChallenges(ctx); err != nil {
-		return []byte{}, err
+	var blob []byte
+	var err error
+
+	for _, i := range MatchProjectPrefix(ctx, pbs.urlPrefixAll) {
+		if err := pbs.authChallenger.tryEstablishChallenges(ctx, i); err != nil {
+			return []byte{}, err
+		}
+		activeStore := pbs.remoteStoreAll[i]
+		blob, err = activeStore.Get(ctx, dgst)
+		if err == nil {
+			break
+		}
 	}
 
-	blob, err = pbs.remoteStore.Get(ctx, dgst)
 	if err != nil {
 		return []byte{}, err
 	}
 
+	/*
 	_, err = pbs.localStore.Put(ctx, "", blob)
 	if err != nil {
-		return []byte{}, err
-	}
+		ret
+	*/
+
 	return blob, nil
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/docker/distribution/registry/proxy/scheduler"
 	"github.com/docker/distribution/registry/storage"
 	"github.com/docker/distribution/registry/storage/driver"
+	"strings"
 )
 
 // proxyingRegistry fetches content from a remote registry and caches it locally
@@ -25,15 +26,57 @@ type proxyingRegistry struct {
 	embedded       distribution.Namespace // provides local registry functionality
 	scheduler      *scheduler.TTLExpirationScheduler
 	remoteURL      url.URL
+	remoteURLAll	[]url.URL
+	urlPrefixAll	[]string
 	authChallenger authChallenger
+}
+
+func MatchProjectPrefix(ctx context.Context, urlPrefixAll []string) []int {
+	matched := []int{}
+	fullURL, _ := ctx.Value("http.request.uri").(string)
+	projectName := strings.Split( fullURL, "/")[2]
+
+	for i := range urlPrefixAll {
+		prefix := urlPrefixAll[i]
+		for _, prefixOnce := range strings.Split(prefix, "|") {
+			if prefixOnce == "*" {
+				matched = append( matched, i)
+			} else if strings.HasSuffix(prefixOnce, "*") &&
+				strings.HasPrefix(projectName, strings.ReplaceAll(prefixOnce,"*", "")) {
+				matched = append( matched, i)
+			} else if strings.HasPrefix(prefixOnce, "*") &&
+				strings.HasSuffix(projectName, strings.ReplaceAll(prefixOnce,"*", "")) {
+				matched = append( matched, i)
+			} else if strings.EqualFold(prefixOnce,projectName) {
+				matched = append( matched, i)
+			}
+		}
+	}
+
+	if len(matched) == 0 {
+		dcontext.GetLogger(ctx).Warnf("No Prefix Matched: %s , %s ", projectName, urlPrefixAll)
+	}
+
+	return matched
 }
 
 // NewRegistryPullThroughCache creates a registry acting as a pull through cache
 func NewRegistryPullThroughCache(ctx context.Context, registry distribution.Namespace, driver driver.StorageDriver, config configuration.Proxy) (distribution.Namespace, error) {
-	remoteURL, err := url.Parse(config.RemoteURL)
-	if err != nil {
-		return nil, err
+	var remoteURLAll	[]url.URL
+	var urlPrefixAll []string
+	var remoteURL url.URL
+	remoteURLStrAll := strings.Split(config.RemoteURL, ",")
+	for _, urlStr := range remoteURLStrAll {
+		t := strings.Split(urlStr,"#")
+		parsedURL, err := url.Parse(t[0])
+		if err != nil {
+			return nil, err
+		}
+		remoteURLAll = append(remoteURLAll, *parsedURL)
+		urlPrefixAll = append(urlPrefixAll, t[1])
 	}
+
+	remoteURL = remoteURLAll[0]
 
 	v := storage.NewVacuum(ctx, driver)
 	s := scheduler.New(ctx, driver, "/scheduler-state.json")
@@ -88,12 +131,12 @@ func NewRegistryPullThroughCache(ctx context.Context, registry distribution.Name
 		return nil
 	})
 
-	err = s.Start()
+	err := s.Start()
 	if err != nil {
 		return nil, err
 	}
 
-	cs, err := configureAuth(config.Username, config.Password, config.RemoteURL)
+	cs, err := configureAuth(config.Username, config.Password, remoteURL.String())
 	if err != nil {
 		return nil, err
 	}
@@ -101,9 +144,12 @@ func NewRegistryPullThroughCache(ctx context.Context, registry distribution.Name
 	return &proxyingRegistry{
 		embedded:  registry,
 		scheduler: s,
-		remoteURL: *remoteURL,
+		remoteURL: remoteURL,
+		remoteURLAll: remoteURLAll,
+		urlPrefixAll: urlPrefixAll,
 		authChallenger: &remoteAuthChallenger{
-			remoteURL: *remoteURL,
+			remoteURL: remoteURL,
+			remoteURLAll: remoteURLAll,
 			cm:        challenge.NewSimpleManager(),
 			cs:        cs,
 		},
@@ -146,37 +192,51 @@ func (pr *proxyingRegistry) Repository(ctx context.Context, name reference.Named
 		return nil, err
 	}
 
-	remoteRepo, err := client.NewRepository(name, pr.remoteURL.String(), tr)
-	if err != nil {
-		return nil, err
-	}
+	var remoteStoreAll []distribution.BlobService
+	var remoteManifestsAll []distribution.ManifestService
+	var remoteTagsAll  []distribution.TagService
 
-	remoteManifests, err := remoteRepo.Manifests(ctx)
-	if err != nil {
-		return nil, err
+	for _ , remoteURL := range pr.remoteURLAll {
+		remoteRepo, err := client.NewRepository(name, remoteURL.String(), tr)
+		if err != nil {
+			return nil, err
+		}
+		remoteManifests, err := remoteRepo.Manifests(ctx)
+		if err != nil {
+			return nil, err
+		}
+		remoteStoreAll = append(remoteStoreAll, remoteRepo.Blobs(ctx))
+		remoteManifestsAll = append(remoteManifestsAll, remoteManifests)
+		remoteTagsAll= append(remoteTagsAll, remoteRepo.Tags(ctx))
 	}
 
 	return &proxiedRepository{
 		blobStore: &proxyBlobStore{
 			localStore:     localRepo.Blobs(ctx),
-			remoteStore:    remoteRepo.Blobs(ctx),
+			remoteStore:    nil,
+			remoteStoreAll: remoteStoreAll,
 			scheduler:      pr.scheduler,
 			repositoryName: name,
 			authChallenger: pr.authChallenger,
+			urlPrefixAll: pr.urlPrefixAll,
 		},
 		manifests: &proxyManifestStore{
 			repositoryName:  name,
 			localManifests:  localManifests, // Options?
-			remoteManifests: remoteManifests,
+			remoteManifests: nil,
+			remoteManifestsAll: remoteManifestsAll,
 			ctx:             ctx,
 			scheduler:       pr.scheduler,
 			authChallenger:  pr.authChallenger,
+			urlPrefixAll: pr.urlPrefixAll,
 		},
 		name: name,
 		tags: &proxyTagService{
 			localTags:      localRepo.Tags(ctx),
-			remoteTags:     remoteRepo.Tags(ctx),
+			remoteTags:     nil,
+			remoteTagsAll:	remoteTagsAll,
 			authChallenger: pr.authChallenger,
+			urlPrefixAll: pr.urlPrefixAll,
 		},
 	}, nil
 }
@@ -191,13 +251,14 @@ func (pr *proxyingRegistry) BlobStatter() distribution.BlobStatter {
 
 // authChallenger encapsulates a request to the upstream to establish credential challenges
 type authChallenger interface {
-	tryEstablishChallenges(context.Context) error
+	tryEstablishChallenges(context.Context, int) error
 	challengeManager() challenge.Manager
 	credentialStore() auth.CredentialStore
 }
 
 type remoteAuthChallenger struct {
 	remoteURL url.URL
+	remoteURLAll []url.URL
 	sync.Mutex
 	cm challenge.Manager
 	cs auth.CredentialStore
@@ -212,11 +273,11 @@ func (r *remoteAuthChallenger) challengeManager() challenge.Manager {
 }
 
 // tryEstablishChallenges will attempt to get a challenge type for the upstream if none currently exist
-func (r *remoteAuthChallenger) tryEstablishChallenges(ctx context.Context) error {
+func (r *remoteAuthChallenger) tryEstablishChallenges(ctx context.Context, idx int) error {
 	r.Lock()
 	defer r.Unlock()
 
-	remoteURL := r.remoteURL
+	remoteURL := r.remoteURLAll[idx]
 	remoteURL.Path = "/v2/"
 	challenges, err := r.cm.GetChallenges(remoteURL)
 	if err != nil {

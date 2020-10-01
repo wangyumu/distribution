@@ -10,7 +10,9 @@ import (
 type proxyTagService struct {
 	localTags      distribution.TagService
 	remoteTags     distribution.TagService
+	remoteTagsAll  []distribution.TagService
 	authChallenger authChallenger
+	urlPrefixAll	[]string
 }
 
 var _ distribution.TagService = proxyTagService{}
@@ -19,23 +21,31 @@ var _ distribution.TagService = proxyTagService{}
 // tag service first and then caching it locally.  If the remote is unavailable
 // the local association is returned
 func (pt proxyTagService) Get(ctx context.Context, tag string) (distribution.Descriptor, error) {
-	err := pt.authChallenger.tryEstablishChallenges(ctx)
-	if err == nil {
-		desc, err := pt.remoteTags.Get(ctx, tag)
+
+	var desc distribution.Descriptor
+	var err error = nil
+	for _, i := range MatchProjectPrefix(ctx, pt.urlPrefixAll) {
+		if err = pt.authChallenger.tryEstablishChallenges(ctx, i); err != nil {
+			return distribution.Descriptor{}, err
+		}
+		remoteTags := pt.remoteTagsAll[i]
+		desc, err = remoteTags.Get(ctx, tag)
 		if err == nil {
-			err := pt.localTags.Tag(ctx, tag, desc)
-			if err != nil {
-				return distribution.Descriptor{}, err
-			}
-			return desc, nil
+			break
 		}
 	}
 
+	if err != nil {
+		return desc, err
+	}
+
+	/*
 	desc, err := pt.localTags.Get(ctx, tag)
 	if err != nil {
 		return distribution.Descriptor{}, err
 	}
-	return desc, nil
+	*/
+	return distribution.Descriptor{}, err
 }
 
 func (pt proxyTagService) Tag(ctx context.Context, tag string, desc distribution.Descriptor) error {
@@ -43,22 +53,30 @@ func (pt proxyTagService) Tag(ctx context.Context, tag string, desc distribution
 }
 
 func (pt proxyTagService) Untag(ctx context.Context, tag string) error {
+	/*
 	err := pt.localTags.Untag(ctx, tag)
 	if err != nil {
 		return err
 	}
+		 */
 	return nil
 }
 
 func (pt proxyTagService) All(ctx context.Context) ([]string, error) {
-	err := pt.authChallenger.tryEstablishChallenges(ctx)
-	if err == nil {
-		tags, err := pt.remoteTags.All(ctx)
+	var tags []string = nil
+	var err error = nil
+	for _, i := range MatchProjectPrefix(ctx, pt.urlPrefixAll) {
+		err := pt.authChallenger.tryEstablishChallenges(ctx, i)
+		if err != nil {
+			return nil, err
+		}
+		remoteTags := pt.remoteTagsAll[i]
+		tags, err = remoteTags.All(ctx)
 		if err == nil {
-			return tags, err
+			break
 		}
 	}
-	return pt.localTags.All(ctx)
+	return tags, err
 }
 
 func (pt proxyTagService) Lookup(ctx context.Context, digest distribution.Descriptor) ([]string, error) {
